@@ -1,6 +1,7 @@
 import sys
 import os
 import subprocess
+import inspect
 
 sys.path.append("./")
 sys.path.append(f"./policy")
@@ -121,7 +122,8 @@ def main(usr_args):
     else:
         embodiment_name = str(embodiment_type[0]) + "+" + str(embodiment_type[1])
 
-    save_dir = Path(f"eval_result/{task_name}/{policy_name}/{task_config}/{ckpt_setting}/{current_time}")
+    output_root = Path(os.environ.get("RMBENCH_OUTPUT_DIR", "eval_result"))
+    save_dir = output_root / task_name / policy_name / task_config / ckpt_setting / current_time
     save_dir.mkdir(parents=True, exist_ok=True)
 
     log_file = save_dir / "eval_log.txt"
@@ -165,10 +167,19 @@ def main(usr_args):
 
     st_seed = 100000 * (1 + seed)
     suc_nums = []
-    test_num = 100
+    test_num = 100  # kept at 100 so instruction sampling matches the reference run
+    # RMBENCH_TEST_NUM overrides the target count of *valid* (expert-passed)
+    # episodes. Repeated-measurement expert sanity checks pass a seed list with
+    # duplicates and set this high so the loop keeps consuming the whole list
+    # instead of stopping at 100. Defaults preserve the reference run.
+    test_num = int(os.environ.get("RMBENCH_TEST_NUM", test_num))
     topk = 1
 
-    model = get_model(usr_args)
+    # RMBENCH_EXPERT_ONLY isolates the expert(Oracle) variable: run expert_check
+    # for every seed but skip the WLA rollout entirely, so no neural-net weights
+    # are loaded. get_model pulls ~7GB + curobo warmup, so we skip it too.
+    expert_only = os.environ.get("RMBENCH_EXPERT_ONLY") == "1"
+    model = None if expert_only else get_model(usr_args)
     st_seed, suc_num, task_total_reward = eval_policy(task_name,
                                    TASK_ENV,
                                    args,
@@ -216,7 +227,18 @@ def eval_policy(task_name,
     print(f"\033[34mTask Name: {args['task_name']}\033[0m")
     print(f"\033[34mPolicy Name: {args['policy_name']}\033[0m")
 
-    expert_check = True
+    # RMBENCH_SKIP_EXPERT trusts a pre-validated seed list (e.g.
+    # battery_try_stable_seeds_ge90.txt, where the expert already succeeds
+    # >=90% of the time) and skips the scripted expert demo entirely, saving one
+    # full expert rollout per candidate. Opt-in: unset keeps the original
+    # behaviour, including the expert-fail bookkeeping the scheduler relies on.
+    skip_expert = os.environ.get("RMBENCH_SKIP_EXPERT") == "1"
+    expert_check = not skip_expert
+    if skip_expert:
+        print(
+            "RMBENCH_SKIP_EXPERT=1: expert demo skipped; every listed seed is "
+            "treated as solvable (expert=pass emitted without an expert run)."
+        )
     TASK_ENV.suc = 0
     TASK_ENV.test_num = 0
 
@@ -224,19 +246,101 @@ def eval_policy(task_name,
     succ_seed = 0
     suc_test_seed_list = []
 
+    # Optional episode-range sharding for multi-GPU parallel eval. Every worker
+    # replays the identical seed-discovery sequence (expert_check) so the
+    # episode<->seed mapping stays consistent, but only runs the expensive
+    # policy rollout for valid episodes whose 0-based index falls in
+    # [ep_start, ep_end). Defaults cover the full run (single-process behavior).
+    ep_start = int(os.environ.get("RMBENCH_EP_START", 0))
+    ep_end = int(os.environ.get("RMBENCH_EP_END", test_num))
+
+    # Optional precomputed seed list. When RMBENCH_SEED_LIST points to a file of
+    # whitespace-separated seeds (already expert-validated as solvable), we
+    # consume those seeds in order instead of scanning st_seed, st_seed+1, ...
+    # Any listed seed that unexpectedly fails expert_check is skipped; once the
+    # list is exhausted before reaching test_num, we fall back to sequential
+    # scanning starting just after the largest listed seed.
+    seed_list = []
+    seed_list_path = os.environ.get("RMBENCH_SEED_LIST", "")
+    if seed_list_path:
+        with open(seed_list_path, "r", encoding="utf-8") as f:
+            seed_list = [int(tok) for tok in f.read().split()]
+        print(f"Loaded {len(seed_list)} seeds from {seed_list_path}")
+    seed_cursor = 0
+
+    # Central-scheduler boundary signals (opt-in; defaults preserve original
+    # behavior). NO_SCAN stops the loop once the provided seed list is
+    # exhausted instead of scanning forward into unowned seeds, so a single-
+    # candidate process never wanders past the seed the scheduler assigned it.
+    # EMIT_RESULT prints one machine-readable WLA_RESULT line per candidate so
+    # the scheduler can attribute expert-fail vs WLA Success/Fail from stdout.
+    seedlist_no_scan = os.environ.get("RMBENCH_SEEDLIST_NO_SCAN") == "1"
+    emit_result = os.environ.get("RMBENCH_EMIT_RESULT") == "1"
+    # Re-read here: main() also reads RMBENCH_EXPERT_ONLY (to skip get_model),
+    # but that local does not cross into this function's scope.
+    expert_only = os.environ.get("RMBENCH_EXPERT_ONLY") == "1"
+    if expert_only and skip_expert:
+        raise ValueError(
+            "RMBENCH_EXPERT_ONLY=1 and RMBENCH_SKIP_EXPERT=1 are contradictory: "
+            "the former measures only the expert verdict, the latter removes it."
+        )
+    seedlist_exhausted = False
+
     policy_name = args["policy_name"]
     eval_func = eval_function_decorator(policy_name, "eval")
     reset_func = eval_function_decorator(policy_name, "reset_model")
+    try:
+        finish_episode_func = eval_function_decorator(policy_name, "finish_episode")
+    except AttributeError:
+        finish_episode_func = None
 
     now_seed = st_seed
     task_total_reward = 0
     clear_cache_freq = args["clear_cache_freq"]
 
+    # Seed selection: in list mode start from the first listed seed; otherwise
+    # start from st_seed. next_seed() advances to the following seed, drawing
+    # from the list until exhausted and then scanning sequentially.
+    def next_seed(current):
+        nonlocal seed_cursor, seedlist_exhausted
+        if seed_list and seed_cursor < len(seed_list):
+            s = seed_list[seed_cursor]
+            seed_cursor += 1
+            return s
+        seedlist_exhausted = True
+        return current + 1
+
+    def emit(seed_val, expert, result=None):
+        # One machine-readable line per candidate for the central scheduler.
+        if not emit_result:
+            return
+        if result is None:
+            print(f"WLA_RESULT seed={seed_val} expert={expert}", flush=True)
+        else:
+            print(f"WLA_RESULT seed={seed_val} expert={expert} result={result}", flush=True)
+
+    if seed_list:
+        now_seed = seed_list[0]
+        seed_cursor = 1
+
     args["eval_mode"] = True
 
     while succ_seed < test_num:
+        # NO_SCAN: once the assigned seed list is consumed, stop instead of
+        # scanning forward into seeds the scheduler never handed to this
+        # process. seedlist_exhausted flips inside next_seed exactly when the
+        # list runs out, so this single top-of-loop guard covers both the
+        # expert-fail and WLA-success paths before any unowned seed is touched.
+        if seedlist_no_scan and seedlist_exhausted:
+            break
+
         render_freq = args["render_freq"]
         args["render_freq"] = 0
+
+        # play_once() is what normally defines episode_info; battery_try returns
+        # self.info with info['info'] == {}, so mirror that shape when skipping
+        # so generate_episode_descriptions() downstream sees an identical value.
+        episode_info = {"info": {}}
 
         if expert_check:
             try:
@@ -248,7 +352,8 @@ def eval_policy(task_name,
                 # print("Error: ", e)
                 # print(" -------------")
                 TASK_ENV.close_env()
-                now_seed += 1
+                emit(now_seed, "fail")
+                now_seed = next_seed(now_seed)
                 args["render_freq"] = render_freq
                 continue
             except Exception as e:
@@ -257,7 +362,8 @@ def eval_policy(task_name,
                 # print("Error: ", e)
                 # print(" -------------")
                 TASK_ENV.close_env()
-                now_seed += 1
+                emit(now_seed, "fail")
+                now_seed = next_seed(now_seed)
                 args["render_freq"] = render_freq
                 print("error occurs !")
                 continue
@@ -266,7 +372,33 @@ def eval_policy(task_name,
             succ_seed += 1
             suc_test_seed_list.append(now_seed)
         else:
-            now_seed += 1
+            emit(now_seed, "fail")
+            now_seed = next_seed(now_seed)
+            args["render_freq"] = render_freq
+            continue
+
+        # Expert-only isolation: the seed passed expert_check, which is the only
+        # signal this mode measures. Emit a pass verdict (result=ExpertOnly to
+        # mark it as a non-rollout run) and skip the WLA rollout entirely, while
+        # advancing episode/seed state exactly like the sharding-skip branch so
+        # a duplicated seed list is consumed one entry per loop.
+        if expert_only:
+            emit(now_seed, "pass", "ExpertOnly")
+            TASK_ENV.close_env(clear_cache=((succ_seed + 1) % clear_cache_freq == 0))
+            now_id += 1
+            TASK_ENV.test_num += 1
+            now_seed = next_seed(now_seed)
+            args["render_freq"] = render_freq
+            continue
+
+        # Sharding: skip the expensive policy rollout for valid episodes outside
+        # this worker's [ep_start, ep_end) range, but keep advancing episode/seed
+        # state so the sequence matches the full single-process run exactly.
+        if not (ep_start <= now_id < ep_end):
+            TASK_ENV.close_env(clear_cache=((succ_seed + 1) % clear_cache_freq == 0))
+            now_id += 1
+            TASK_ENV.test_num += 1
+            now_seed = next_seed(now_seed)
             args["render_freq"] = render_freq
             continue
 
@@ -308,7 +440,10 @@ def eval_policy(task_name,
             TASK_ENV._set_eval_video_ffmpeg(ffmpeg)
 
         succ = False
-        reset_func(model)
+        if "episode_seed" in inspect.signature(reset_func).parameters:
+            reset_func(model, episode_seed=now_seed)
+        else:
+            reset_func(model)
         while TASK_ENV.take_action_cnt < TASK_ENV.step_lim:
             observation = TASK_ENV.get_obs()
             eval_func(TASK_ENV, model, observation)
@@ -326,6 +461,11 @@ def eval_policy(task_name,
         else:
             print("\033[91mFail!\033[0m", " | max reward:", TASK_ENV.max_reward)
             result_str = "Fail"
+
+        if finish_episode_func is not None:
+            finish_episode_func(model, success=succ)
+
+        emit(now_seed, "pass", result_str)
 
         log_file = args.get("log_file", None)
         if log_file is not None:
@@ -352,7 +492,7 @@ def eval_policy(task_name,
             f"Success rate: \033[96m{TASK_ENV.suc}/{TASK_ENV.test_num}\033[0m => \033[95m{round(TASK_ENV.suc/TASK_ENV.test_num*100, 1)}%\033[0m, current seed: \033[90m{now_seed}\033[0m\n"
         )
         # TASK_ENV._take_picture()
-        now_seed += 1
+        now_seed = next_seed(now_seed)
 
     return now_seed, TASK_ENV.suc, task_total_reward
 
