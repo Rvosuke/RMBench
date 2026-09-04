@@ -743,7 +743,7 @@ def planner_process_worker(conn, args):
             else:
                 conn.send({"error": f"Unknown command {msg['cmd']}"})
 
-        except EOFError:
+        except (EOFError, BrokenPipeError):
             break
         except Exception as e:
             conn.send({"error": str(e)})

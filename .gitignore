@@ -37,3 +37,6 @@ envs/curobo/*
 policy/WLA_*/
 *.bak.hk-orig
 *.bak.pre-*
+
+# --- eval artifacts (per-machine rollout products, never source) ---
+eval_result/
