@@ -81,6 +81,7 @@ def main(usr_args):
 
     if (
         os.environ.get("RMBENCH_FAST_EVAL") == "1"
+        and args["render_freq"] == 0
         and not args["domain_randomization"]["random_light"]
     ):
         args["eval_video_log"] = False
