@@ -79,7 +79,10 @@ def main(usr_args):
     with open(f"./task_config/{task_config}.yml", "r", encoding="utf-8") as f:
         args = yaml.load(f.read(), Loader=yaml.FullLoader)
 
-    if os.environ.get("RMBENCH_FAST_EVAL") == "1":
+    if (
+        os.environ.get("RMBENCH_FAST_EVAL") == "1"
+        and not args["domain_randomization"]["random_light"]
+    ):
         args["eval_video_log"] = False
         args["data_type"]["third_view"] = False
 
