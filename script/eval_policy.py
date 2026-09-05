@@ -79,6 +79,10 @@ def main(usr_args):
     with open(f"./task_config/{task_config}.yml", "r", encoding="utf-8") as f:
         args = yaml.load(f.read(), Loader=yaml.FullLoader)
 
+    if os.environ.get("RMBENCH_FAST_EVAL") == "1":
+        args["eval_video_log"] = False
+        args["data_type"]["third_view"] = False
+
     args['task_name'] = task_name
     args["task_config"] = task_config
     args["ckpt_setting"] = ckpt_setting

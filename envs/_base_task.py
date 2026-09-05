@@ -1522,9 +1522,18 @@ class Base_Task(gym.Env):
 
         return True  # TODO: maybe need try error
 
-    def take_action(self, action, action_type:Literal['qpos', 'ee']='qpos'):  # action_type: qpos or ee
+    def take_action(
+        self,
+        action,
+        action_type: Literal['qpos', 'ee'] = 'qpos',
+        render=True,
+    ):  # action_type: qpos or ee
         if self.take_action_cnt == self.step_lim or self.eval_success:
             return
+
+        # Video callers still require a fresh frame for every action.
+        if self.eval_video_path is not None:
+            render = True
 
         eval_video_freq = 1  # fixed
         if (self.eval_video_path is not None and self.take_action_cnt % eval_video_freq == 0):
@@ -1534,9 +1543,10 @@ class Base_Task(gym.Env):
         self.take_action_cnt += 1
         print(f"step: \033[92m{self.take_action_cnt} / {self.step_lim}\033[0m", end="\r")
 
-        self._update_render()
-        if self.render_freq:
-            self.viewer.render()
+        if render:
+            self._update_render()
+            if self.render_freq:
+                self.viewer.render()
 
         actions = np.array([action])
         if not self.is_dual_arm:
@@ -1710,18 +1720,21 @@ class Base_Task(gym.Env):
                     now_right_id += 1
 
             self.scene.step()
-            self._update_render()
-                
+            if render:
+                self._update_render()
+
             if self.check_success():
                 self.eval_success = True
-                self.get_obs() # update obs
-                if (self.eval_video_path is not None):
-                    self.eval_video_ffmpeg.stdin.write(self.now_obs["third_view_rgb"].tobytes())
+                if render:
+                    self.get_obs()  # update obs
+                    if self.eval_video_path is not None:
+                        self.eval_video_ffmpeg.stdin.write(self.now_obs["third_view_rgb"].tobytes())
                 return
 
-        self._update_render()
-        if self.render_freq:  # UI
-            self.viewer.render()
+        if render:
+            self._update_render()
+            if self.render_freq:  # UI
+                self.viewer.render()
 
 
     def save_camera_images(self, task_name, step_name, generate_num_id, save_dir="./camera_images"):
